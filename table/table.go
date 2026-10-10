@@ -643,15 +643,16 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 				orphanedManifests = append(orphanedManifests, su.supersededSource.supersededManifests(committed)...)
 			}
 		}
+		removeAttempted := false
 		for _, path := range orphanedManifests {
+			removeAttempted = true
 			if removeErr := wfs.Remove(path); removeErr != nil {
 				log.Printf("Warning: failed to delete orphaned manifest list %s: %v", path, removeErr)
 			}
 		}
 		// Resubmitting staged updates after cleanup would reference deleted files.
-		if !committed && retErr != nil && len(orphanedManifests) > 0 {
-			retErr = fmt.Errorf("%w (staged files were cleaned up, build a new transaction to retry): %w",
-				retErr, ErrTransactionUnusable)
+		if !committed && retErr != nil && removeAttempted && !errors.Is(retErr, ErrTransactionUnusable) {
+			retErr = &unusableCommitError{reason: "staged files were cleaned up", cause: retErr}
 		}
 	}()
 
@@ -705,8 +706,7 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 			reqs = rewriteRefSnapshotRequirements(reqs, co.branch, current, co.pinnedRefs)
 
 			if err := validateNonRebasedRequirements(reqs, co.branch, co.pinnedRefs, current); err != nil {
-				return nil, fmt.Errorf("%w: requirement no longer holds after refresh: %w: %w",
-					ErrCommitFailed, err, ErrTransactionUnusable)
+				return nil, &unusableCommitError{reason: "requirement no longer holds after refresh", cause: err, conflict: true}
 			}
 			if err := validateBranchRequirement(reqs, co.branch, current); err != nil {
 				return nil, err
@@ -791,8 +791,17 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 		// of replaying (see commitOpts.noReplay). The annotation
 		// distinguishes this abort from an exhausted retry budget while
 		// preserving errors.Is(err, ErrCommitFailed).
+		// Transaction.Commit resends the same requirements and removals, so
+		// without a retry to rebase them a re-commit can only fail again.
 		if co.noReplay {
-			return nil, fmt.Errorf("%w (commit carries snapshot-relative delete-file removals and cannot be replayed; reload the table and rebuild the removals)", err)
+			return nil, &unusableCommitError{
+				reason:   "commit carries snapshot-relative delete-file removals and cannot be replayed; reload the table and rebuild the removals",
+				cause:    err,
+				conflict: true,
+			}
+		}
+		if cfg.numRetries == 0 {
+			return nil, &unusableCommitError{reason: "commit conflicted with retries disabled", cause: err, conflict: true}
 		}
 	}
 
@@ -900,6 +909,28 @@ func validateNonRebasedRequirements(reqs []Requirement, branch string, pinned ma
 	}
 
 	return nil
+}
+
+// unusableCommitError ends a commit that no re-commit of the same updates
+// can fix. It matches ErrTransactionUnusable and the cause, and also
+// ErrCommitFailed when conflict is set, but its message leads with
+// ErrTransactionUnusable so it does not read as retryable.
+type unusableCommitError struct {
+	reason   string
+	cause    error
+	conflict bool
+}
+
+func (e *unusableCommitError) Error() string {
+	return fmt.Sprintf("%s: %s: %s", ErrTransactionUnusable, e.reason, e.cause)
+}
+
+func (e *unusableCommitError) Unwrap() []error {
+	if e.conflict {
+		return []error{ErrTransactionUnusable, ErrCommitFailed, e.cause}
+	}
+
+	return []error{ErrTransactionUnusable, e.cause}
 }
 
 func validateBranchRequirement(reqs []Requirement, branch string, meta Metadata) error {

@@ -30,7 +30,9 @@ package table
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -52,6 +54,9 @@ type headTrackingCatalog struct {
 	metadata Metadata
 	attempts atomic.Int32
 	loads    atomic.Int32
+	// opaque rejects without naming the failed requirement, as a REST
+	// 409 does.
+	opaque bool
 }
 
 type identifierCapturingCatalog struct {
@@ -72,6 +77,10 @@ func (c *headTrackingCatalog) CommitTable(_ context.Context, _ Identifier, reqs 
 	c.attempts.Add(1)
 	for _, req := range reqs {
 		if err := req.Validate(c.metadata); err != nil {
+			if c.opaque {
+				return nil, "", fmt.Errorf("%w: 409 conflict", ErrCommitFailed)
+			}
+
 			return nil, "", fmt.Errorf("%w: %w", ErrCommitFailed, err)
 		}
 	}
@@ -220,15 +229,32 @@ func TestDoCommit_ValidatorRejectsOnRefresh(t *testing.T) {
 
 // A stale schema requirement cannot be rebased, but a valid one must not
 // prevent retrying against a changed branch head.
+func TestUnusableCommitErrorMatchesBothSentinels(t *testing.T) {
+	cause := errors.New("requirement failed: ref \"main\" is a tag, tags cannot be transaction targets")
+	err := &unusableCommitError{reason: "requirement no longer holds after refresh", cause: cause, conflict: true}
+
+	assert.ErrorIs(t, err, ErrTransactionUnusable)
+	assert.ErrorIs(t, err, ErrCommitFailed)
+	assert.ErrorIs(t, err, cause)
+	assert.Equal(t, "transaction cannot be committed again: requirement no longer holds after refresh: "+cause.Error(), err.Error())
+
+	cleanup := &unusableCommitError{reason: "staged files were cleaned up", cause: cause}
+	assert.ErrorIs(t, cleanup, ErrTransactionUnusable)
+	assert.NotErrorIs(t, cleanup, ErrCommitFailed, "a cleanup after a non-conflict failure is not a conflict")
+}
+
 func TestDoCommit_NonRebasedRequirementFailsAfterOneRefresh(t *testing.T) {
 	writerHead := int64(100)
-	props := iceberg.Properties{
-		CommitNumRetriesKey:     "3",
-		CommitMinRetryWaitMsKey: "1",
-		CommitMaxRetryWaitMsKey: "2",
+	retryProps := func(numRetries string) iceberg.Properties {
+		return iceberg.Properties{
+			CommitNumRetriesKey:     numRetries,
+			CommitMinRetryWaitMsKey: "1",
+			CommitMaxRetryWaitMsKey: "2",
+		}
 	}
+	props := retryProps("3")
 
-	t.Run("stale schema update fails without retrying", func(t *testing.T) {
+	stalePeerSchema := func(t *testing.T, props iceberg.Properties) (*headTrackingCatalog, *Transaction) {
 		writerBase := newConflictTestMetadataWithProps(t, &writerHead, props)
 
 		builder, err := MetadataBuilderFromBase(writerBase, "")
@@ -248,13 +274,38 @@ func TestDoCommit_NonRebasedRequirementFailsAfterOneRefresh(t *testing.T) {
 			AddColumn([]string{"writer"}, iceberg.PrimitiveTypes.String, "", false, nil).
 			Commit())
 
-		_, err = tx.Commit(t.Context())
-		require.Error(t, err)
-		assert.ErrorIs(t, err, ErrCommitFailed)
-		assert.Contains(t, err.Error(), "requirement no longer holds after refresh")
+		return cat, tx
+	}
+
+	t.Run("stale schema update fails after one refresh", func(t *testing.T) {
+		cat, tx := stalePeerSchema(t, props)
+		cat.opaque = true
+
+		_, err := tx.Commit(t.Context())
+		require.ErrorIs(t, err, ErrCommitFailed)
+		require.ErrorIs(t, err, ErrTransactionUnusable)
+		assert.True(t, strings.HasPrefix(err.Error(),
+			"transaction cannot be committed again: requirement no longer holds after refresh: "), err.Error())
 		assert.Equal(t, int32(1), cat.attempts.Load(), "the stale requirement must not be resubmitted")
 		assert.Equal(t, int32(1), cat.loads.Load(), "the commit must stop after the first refresh")
 		assert.Equal(t, 1, cat.metadata.CurrentSchema().ID, "the peer's schema must survive")
+	})
+
+	t.Run("retries disabled ends the commit without a refresh", func(t *testing.T) {
+		cat, tx := stalePeerSchema(t, retryProps("0"))
+		cat.opaque = true
+
+		_, err := tx.Commit(t.Context())
+		require.ErrorIs(t, err, ErrCommitFailed)
+		require.ErrorIs(t, err, ErrTransactionUnusable)
+		assert.True(t, strings.HasPrefix(err.Error(),
+			"transaction cannot be committed again: commit conflicted with retries disabled: "), err.Error())
+		assert.Equal(t, int32(1), cat.attempts.Load())
+		assert.Equal(t, int32(0), cat.loads.Load())
+
+		_, err = tx.Commit(t.Context())
+		require.ErrorIs(t, err, ErrTransactionUnusable)
+		assert.Equal(t, int32(1), cat.attempts.Load())
 	})
 
 	t.Run("requirements that still hold do not block the rebase", func(t *testing.T) {

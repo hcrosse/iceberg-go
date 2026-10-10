@@ -1608,15 +1608,25 @@ func (s *SqliteCatalogTestSuite) TestStaleAppendRetriesRequirementFailure() {
 			_, err = appendStringRow(ctx, peer, "peer")
 			s.Require().NoError(err)
 
-			_, err = appendStringRow(ctx, stale, "stale")
+			tx := stale.NewTransaction()
+			s.stageStringRow(ctx, tx, "stale")
+			_, err = tx.Commit(ctx)
 			if tt.numRetries == "0" {
-				s.Require().Error(err)
-				s.ErrorIs(err, table.ErrCommitFailed)
+				s.Require().ErrorIs(err, table.ErrCommitFailed)
+				s.Require().ErrorIs(err, table.ErrTransactionUnusable)
 				s.Contains(err.Error(), "has changed")
 
 				current, err := cat.LoadTable(ctx, tblID)
 				s.Require().NoError(err)
-				s.ElementsMatch([]string{"seed", "peer"}, s.storedStringValues(ctx, current))
+
+				_, err = tx.Commit(ctx)
+				s.Require().ErrorIs(err, table.ErrTransactionUnusable)
+				s.Contains(err.Error(), "a previous commit failed", "the second commit must stop before the catalog")
+
+				after, err := cat.LoadTable(ctx, tblID)
+				s.Require().NoError(err)
+				s.Equal(current.MetadataLocation(), after.MetadataLocation())
+				s.ElementsMatch([]string{"seed", "peer"}, s.storedStringValues(ctx, after))
 
 				return
 			}
@@ -1628,6 +1638,111 @@ func (s *SqliteCatalogTestSuite) TestStaleAppendRetriesRequirementFailure() {
 			s.ElementsMatch([]string{"seed", "peer", "stale"}, s.storedStringValues(ctx, current))
 		})
 	}
+}
+
+// peerAfterRefreshCatalog runs peer once, right after the first LoadTable
+// the commit retry loop makes, so the catalog changes between the refresh
+// and the next attempt.
+type peerAfterRefreshCatalog struct {
+	*sqlcat.Catalog
+	peer  func()
+	loads int
+}
+
+func (c *peerAfterRefreshCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	c.loads++
+	tbl, err := c.Catalog.LoadTable(ctx, ident)
+	if peer := c.peer; peer != nil {
+		c.peer = nil
+		peer()
+	}
+
+	return tbl, err
+}
+
+func (s *SqliteCatalogTestSuite) addStringColumn(ctx context.Context, tbl *table.Table, name string) *table.Transaction {
+	tx := tbl.NewTransaction()
+	s.Require().NoError(tx.UpdateSchema(true, false).
+		AddColumn([]string{name}, iceberg.PrimitiveTypes.String, "", false, nil).
+		Commit())
+
+	return tx
+}
+
+func (s *SqliteCatalogTestSuite) TestStaleSchemaUpdateRejectedByCatalogIsUnusable() {
+	ctx := context.Background()
+	cat := s.getCatalogSqlite()
+	defer cat.Close()
+	tblID := s.createRetryingStringTable(ctx, cat, "0", "seed")
+
+	stale, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	tx := s.addStringColumn(ctx, stale, "stale")
+
+	peer, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	_, err = s.addStringColumn(ctx, peer, "peer").Commit(ctx)
+	s.Require().NoError(err)
+	peerMeta, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+
+	_, err = tx.Commit(ctx)
+	s.Require().ErrorIs(err, table.ErrCommitFailed)
+	s.Require().ErrorIs(err, table.ErrTransactionUnusable)
+
+	_, err = tx.Commit(ctx)
+	s.Require().ErrorIs(err, table.ErrTransactionUnusable)
+
+	current, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	s.Equal(peerMeta.MetadataLocation(), current.MetadataLocation(), "nothing may be committed")
+}
+
+func (s *SqliteCatalogTestSuite) TestStaleSchemaUpdateRejectedOnFinalAttemptIsRefusedAfterOneRefresh() {
+	ctx := context.Background()
+	cat := s.getCatalogSqlite()
+	defer cat.Close()
+	tblID := s.createRetryingStringTable(ctx, cat, "1", "seed")
+
+	loaded, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	wrapped := &peerAfterRefreshCatalog{Catalog: cat}
+	stale := table.New(loaded.Identifier(), loaded.Metadata(), loaded.MetadataLocation(), loaded.FS, wrapped)
+	tx := s.addStringColumn(ctx, stale, "stale")
+
+	peer, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	_, err = appendStringRow(ctx, peer, "peer")
+	s.Require().NoError(err)
+
+	var peerLocation string
+	wrapped.peer = func() {
+		peer, err := cat.LoadTable(ctx, tblID)
+		s.Require().NoError(err)
+		committed, err := s.addStringColumn(ctx, peer, "peer").Commit(ctx)
+		s.Require().NoError(err)
+		peerLocation = committed.MetadataLocation()
+	}
+
+	_, err = tx.Commit(ctx)
+	s.Require().ErrorIs(err, table.ErrCommitFailed)
+	s.Require().NotErrorIs(err, table.ErrTransactionUnusable)
+	s.Require().NotEmpty(peerLocation, "the peer must commit between the refresh and the final attempt")
+	s.Require().Equal(1, wrapped.loads)
+
+	_, err = tx.Commit(ctx)
+	s.Require().ErrorIs(err, table.ErrCommitFailed)
+	s.Require().ErrorIs(err, table.ErrTransactionUnusable)
+	s.Contains(err.Error(), "requirement no longer holds after refresh")
+	s.Equal(2, wrapped.loads, "the second commit must stop after one refresh")
+
+	_, err = tx.Commit(ctx)
+	s.Require().ErrorIs(err, table.ErrTransactionUnusable)
+	s.Equal(2, wrapped.loads)
+
+	current, err := cat.LoadTable(ctx, tblID)
+	s.Require().NoError(err)
+	s.Equal(peerLocation, current.MetadataLocation(), "nothing may be committed")
 }
 
 func (s *SqliteCatalogTestSuite) TestStaleAppendWithNoOpExpireRetriesAfterPeerAppend() {

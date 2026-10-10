@@ -1081,6 +1081,7 @@ func TestRewriteManifestsCleansOnNonRebasedRequirementFailure(t *testing.T) {
 	_, err = txn.Commit(ctx)
 	require.ErrorIs(t, err, table.ErrCommitFailed)
 	require.ErrorIs(t, err, table.ErrTransactionUnusable)
+	assert.Equal(t, 1, strings.Count(err.Error(), table.ErrTransactionUnusable.Error()), err.Error())
 	require.EqualValues(t, 1, cat.commitTableCalls.Load(), "the violated fence must stop the retry loop")
 
 	merged := mergedManifestsCreated(track, preExisting)

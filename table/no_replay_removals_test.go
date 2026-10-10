@@ -75,8 +75,9 @@ func newNoReplayV3Table(t *testing.T) (*table.Table, *concurrentTestCatalog) {
 // Condition: a data file carries DV1; a peer supersedes DV1 with its
 // own merged DV; a stale writer (still seeing DV1 live) then commits
 // its own supersession with retries enabled.
-// Assertion: the stale commit fails wrapping ErrCommitFailed after
-// exactly one CommitTable attempt (no replay), and the table carries
+// Assertion: the stale commit fails wrapping ErrCommitFailed and
+// ErrTransactionUnusable after exactly one CommitTable attempt (no
+// replay), a re-commit is refused before the catalog, and the table carries
 // exactly one live DV — the peer's — so only the peer's deletes apply.
 func TestMoRDeleteSupersedingDVFailsInsteadOfReplaying(t *testing.T) {
 	ctx := context.Background()
@@ -111,13 +112,13 @@ func TestMoRDeleteSupersedingDVFailsInsteadOfReplaying(t *testing.T) {
 	assert.Equal(t, attemptsBefore+1, cat.attempts.Load(),
 		"a commit carrying DV removals must fail on the first CAS conflict, not refresh-and-replay")
 
-	// The clean conflict leaves the transaction retriable, not latched
-	// as committed: a naive same-transaction retry surfaces a fresh
-	// conflict (its requirement still targets the stale base) rather
-	// than "transaction has already been committed".
+	assert.ErrorIs(t, err, table.ErrTransactionUnusable)
+	assert.Contains(t, err.Error(), "reload the table and rebuild the removals")
+
+	attemptsBefore = cat.attempts.Load()
 	_, err = staleTxn.Commit(ctx)
-	require.Error(t, err)
-	assert.ErrorIs(t, err, table.ErrCommitFailed)
+	require.ErrorIs(t, err, table.ErrTransactionUnusable)
+	assert.Equal(t, attemptsBefore, cat.attempts.Load(), "an unusable transaction must not reach the catalog")
 
 	// The table is uncorrupted: exactly one live DV (the peer's merged
 	// one) references the data file, and only the peer's deletes apply.

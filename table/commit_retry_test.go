@@ -1011,9 +1011,7 @@ func countAssertTableUUID(reqs []Requirement) int {
 	return n
 }
 
-func TestTransactionCommit_RetriableAfterCleanConflict(t *testing.T) {
-	// Default retry config (numRetries == 0): each Commit is a single
-	// CommitTable attempt. The first fails with a clean conflict, the second succeeds.
+func TestTransactionCommit_UnusableAfterConflictWithRetriesDisabled(t *testing.T) {
 	cat := &sequentialCatalog{
 		errs: []error{ErrCommitFailed},
 	}
@@ -1024,26 +1022,14 @@ func TestTransactionCommit_RetriableAfterCleanConflict(t *testing.T) {
 	require.NoError(t, tx.SetProperties(map[string]string{"key": "value"}))
 
 	_, err := tx.Commit(t.Context())
-	require.ErrorIs(t, err, ErrCommitFailed, "first commit must surface the clean conflict")
-	assert.False(t, tx.committed, "clean-conflict failure must leave committed == false")
-	assert.Equal(t, int32(1), cat.attempts.Load(), "first commit must reach the catalog once")
+	require.ErrorIs(t, err, ErrCommitFailed)
+	require.ErrorIs(t, err, ErrTransactionUnusable)
+	assert.Equal(t, int32(1), cat.attempts.Load())
 
-	// The transaction stays usable: applying further changes and retrying the
-	// commit must both be allowed.
-	require.NoError(t, tx.SetProperties(map[string]string{"key2": "value2"}),
-		"apply must be allowed after a failed commit")
-
-	committed, err := tx.Commit(t.Context())
-	require.NoError(t, err, "commit retry must be allowed after a clean conflict")
-	require.NotNil(t, committed)
-	assert.True(t, tx.committed, "committed must be set only after a successful commit")
-	assert.Equal(t, int32(2), cat.attempts.Load(), "the retry must reach the catalog")
-
-	assert.Equal(t, 1, countAssertTableUUID(cat.lastReqs),
-		"retry must not append a duplicate AssertTableUUID")
-
+	require.ErrorIs(t, tx.SetProperties(map[string]string{"key2": "value2"}), ErrTransactionUnusable)
 	_, err = tx.Commit(t.Context())
-	assert.ErrorContains(t, err, "already been committed")
+	require.ErrorIs(t, err, ErrTransactionUnusable)
+	assert.Equal(t, int32(1), cat.attempts.Load(), "an unusable transaction must not reach the catalog")
 }
 
 // doCommit exhausts its own retry loop on ErrCommitFailed, the transaction must still be left retriable.
@@ -1065,8 +1051,15 @@ func TestTransactionCommit_RetriableAfterExhaustedInternalRetries(t *testing.T) 
 
 	_, err := tx.Commit(t.Context())
 	require.ErrorIs(t, err, ErrCommitFailed)
+	assert.NotErrorIs(t, err, ErrTransactionUnusable)
 	assert.Equal(t, int32(3), cat.attempts.Load(), "doCommit must exhaust all internal attempts")
 	assert.False(t, tx.committed, "exhausted clean-conflict retries must leave committed == false")
+
+	_, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, int32(4), cat.attempts.Load())
+	assert.Equal(t, 1, countAssertTableUUID(cat.lastReqs),
+		"retry must not append a duplicate AssertTableUUID")
 }
 
 func TestTransactionCommit_UnusableAfterAppendRetriesExhausted(t *testing.T) {
