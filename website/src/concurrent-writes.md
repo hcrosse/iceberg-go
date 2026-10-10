@@ -100,3 +100,11 @@ by `AssertRefSnapshotID`, `RollbackToSnapshot`, or `ExpireSnapshots`, must still
 hold. Otherwise, the commit fails without another attempt, with an error that
 matches both `ErrCommitFailed` and `ErrTransactionUnusable`. The same transaction
 cannot be committed again. Reload the table and build a new transaction.
+
+A transaction also becomes unusable when its commit conflicts with retries
+disabled, or while it carries delete-file removals that cannot be replayed,
+since a re-commit sends the same requirements. It becomes unusable
+once a failed commit cleaned up files the staged updates reference too. That
+happens on any failure after an attempt was rebuilt against a refreshed table,
+or after a rewrite staged files, including a refresh error or a cancelled
+context. A failure whose commit state is unknown deletes nothing.

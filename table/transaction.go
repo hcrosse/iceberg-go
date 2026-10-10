@@ -3381,10 +3381,12 @@ func (t *Transaction) Commit(ctx context.Context) (*Table, error) {
 		)
 		if err != nil {
 			// A clean conflict (ErrCommitFailed) stays retriable unless the error
-			// also matches ErrTransactionUnusable: cleanup removed files the staged
-			// updates reference, or a requirement failed after a refresh. Any other
-			// failure leaves the commit state unknown, so mark it terminal to avoid
-			// a double-apply.
+			// also matches ErrTransactionUnusable. That happens when retries are
+			// disabled or the commit cannot be replayed, when a non-rebased
+			// requirement fails against the refreshed table, and on any failure
+			// once files were cleaned up after a rebuilt attempt or a rewrite,
+			// including a refresh error or a cancelled context. Any other failure leaves the commit state
+			// unknown, so mark it terminal to avoid a double-apply.
 			if !errors.Is(err, ErrCommitFailed) {
 				t.committed = true
 			}

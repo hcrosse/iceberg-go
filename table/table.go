@@ -50,16 +50,20 @@ import (
 // commit fails due to a concurrent modification (e.g. HTTP 409 Conflict
 // from the REST catalog). Catalog implementations should wrap this
 // error so that callers using errors.Is(err, table.ErrCommitFailed)
-// can detect retryable commit conflicts. Failed requirements also wrap it.
-// Requirements other than the implicit commit-branch assertion are not rebased.
-// When an error matches both ErrCommitFailed and ErrTransactionUnusable,
-// retrying the same transaction cannot succeed. Reload the table and build a
-// new transaction.
+// can detect commit conflicts, which are retryable unless the error also
+// matches ErrTransactionUnusable. In that case, reload the table and build a
+// new transaction. Failed requirements also wrap it. Requirements other than
+// the implicit commit-branch assertion are not rebased.
 var ErrCommitFailed = errors.New("commit failed, refresh and try again")
 
-// ErrTransactionUnusable is returned when a failed commit removed files
-// referenced by staged updates, or when a requirement fails after a refresh.
-// The transaction cannot be committed again. Build a new transaction to retry.
+// ErrTransactionUnusable is returned when no later commit of the same
+// transaction can succeed: the commit conflicted with retries disabled or
+// while carrying delete-file removals that cannot be replayed, a requirement
+// the retry loop does not rebase failed against the refreshed table, or files
+// the staged updates reference were cleaned up. Cleanup
+// follows any failure of known state once an attempt was rebuilt or a
+// rewrite staged files, including a refresh error or a cancelled context.
+// Build a new transaction to retry.
 var ErrTransactionUnusable = errors.New("transaction cannot be committed again")
 
 // ErrWriteIORequired is returned by write paths when the table's file system
